@@ -1,2 +1,5 @@
-flask
 fastmcp
+flask
+openai
+python-dotenv
+chromadb

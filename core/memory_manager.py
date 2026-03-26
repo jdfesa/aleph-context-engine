@@ -1,145 +1,138 @@
-import json
 import os
-import time
-import hashlib
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Any
-from datetime import datetime
+from dotenv import load_dotenv
 
-# Configuration
-# Store data relative to the project root to ensure portability between Windows/Linux in shared folders
+# Import our new SQLite manager
+from core.db_manager import db
+from core.vector_db import vector_db
+
+load_dotenv()
+
 PROJECT_ROOT = Path(__file__).parent.parent
-CACHE_DIR = PROJECT_ROOT / "data" / "memories"
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
+VAULT_PATH_STR = os.getenv("OBSIDIAN_VAULT_PATH", str(PROJECT_ROOT / "00_inbox_fallback"))
+VAULT_ROOT = Path(VAULT_PATH_STR)
 
+# We enforce the SOP: All AI generated content goes to 00_inbox
+INBOX_DIR = VAULT_ROOT / "00_inbox"
+INBOX_DIR.mkdir(parents=True, exist_ok=True)
 
 class MemoryManager:
+    """
+    Aleph Context Engine - Phase 2 Memory Manager
+    Handles writing physical Markdown files to the Inbox directory obeying the Vault SOP.
+    """
     def __init__(self):
-        self.cache_dir = CACHE_DIR
+        self.inbox_dir = INBOX_DIR
 
-    def _get_file_path(self, key: str) -> Path:
-        """Get the file path for a given memory key."""
-        safe_key = hashlib.md5(key.encode()).hexdigest()
-        return self.cache_dir / f"{safe_key}.json"
+    def _get_file_path(self, title: str) -> Path:
+        """Returns physical .md path using Zettelkasten prefix to avoid collisions."""
+        timestamp = datetime.now().astimezone().strftime('%y%m%d%H%M')
+        clean_title = title.replace('.md', '').strip().replace(' ', '_')
+        
+        # Base format: YYMMDDHHMM_snake_case_title.md
+        filename = f"{timestamp}_{clean_title}.md"
+        path = self.inbox_dir / filename
+        
+        # Collision Prevention (Phase 3 via SQLite)
+        # If the DB knows this title exists ANYWHERE in the vault, we append conflict to obey SOPs.
+        counter = 1
+        final_title = clean_title
+        while db.note_exists(final_title) or path.exists():
+            final_title = f"{clean_title}_conflict_{counter}"
+            filename = f"{timestamp}_{final_title}.md"
+            path = self.inbox_dir / filename
+            counter += 1
+            
+        return path, timestamp, final_title
 
-    def store_memory(
-        self, key: str, content: str, tags: List[str] = None, title: str = None
-    ) -> Dict[str, Any]:
-        """Store a new memory or overwrite an existing one."""
-        file_path = self._get_file_path(key)
-        # Use local system timezone
-        now = datetime.now().astimezone().isoformat()
+    def store_memory(self, raw_input: str, formatted_data: dict) -> Dict[str, Any]:
+        """Saves formatted memory directly to the 00_inbox as an atomic Concept .md file."""
+        title = formatted_data.get("title", "untitled_concept")
+        tags_list = formatted_data.get("tags", ["area/inbox/unprocessed"])
+        content = formatted_data.get("content", raw_input)
+        
+        # Format tags properly for frontmatter
+        tags_str = ", ".join(tags_list) if isinstance(tags_list, list) else tags_list
+        tags_array = f"[{tags_str}]"
+        
+        now = datetime.now().astimezone().strftime('%Y-%m-%d')
+        file_path, note_id, safe_title = self._get_file_path(title)
+        
+        # Build Obsidian YAML Frontmatter (Adhering to Vault SOP)
+        md_content = f"""---
+title: {safe_title}
+status: seed
+tags: {tags_array}
+last_reviewed: {now}
+---
+# {safe_title}
 
-        # Note: Edit history logging is now handled by the caller (server.py or webui.py)
-        # to prevent duplicate logs and allow for more context-aware messages.
+## 💡 Concept
+{content}
 
-        memory_data = {
-            "key": key,
-            "title": title or key,  # Default title to key if not provided
-            "content": content,
-            "tags": tags or [],
-            "created_at": now,
-            "updated_at": now,
-            "lines": len(content.splitlines()),
-            "chars": len(content),
-        }
-
-        # If updating, preserve created_at and existing title if new one not provided
-        if file_path.exists():
-            try:
-                with open(file_path, "r", encoding="utf-8") as f:
-                    existing = json.load(f)
-                    memory_data["created_at"] = existing.get("created_at", now)
-                    if not title:
-                        memory_data["title"] = existing.get("title", key)
-            except:
-                pass  # Overwrite if corrupt
-
+## 🔗 Connections
+- MOC: [[architecture_moc]]
+"""
+        # Save to real Obsidian Vault
         with open(file_path, "w", encoding="utf-8") as f:
-            json.dump(memory_data, f, indent=2, ensure_ascii=False)
-
-        return memory_data
-
-    def retrieve_memory(self, key: str) -> Optional[Dict[str, Any]]:
-        """Retrieve a memory by key."""
-        file_path = self._get_file_path(key)
-        if not file_path.exists():
-            return None
-
-        try:
-            with open(file_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                return data
-        except Exception as e:
-            # Silently fail - don't print to stdout as it corrupts MCP stdio transport
-            return None
-
-        try:
-            with open(file_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                print(f"DEBUG: loaded data for key={key}")
-                return data
-        except Exception as e:
-            print(f"DEBUG: exception loading {key}: {e}")
-            # Silently fail - don't print to stdout as it corrupts MCP stdio transport
-            return None
-
-    def list_memories(self) -> List[Dict[str, Any]]:
-        """List all memories with metadata."""
-        memories = []
-        for file_path in self.cache_dir.glob("*.json"):
-            try:
-                with open(file_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    # Add a snippet for display
-                    data["snippet"] = (
-                        data["content"][:100] + "..."
-                        if len(data["content"]) > 100
-                        else data["content"]
-                    )
-                    # Ensure title exists for legacy memories
-                    if "title" not in data:
-                        data["title"] = data["key"]
-                    memories.append(data)
-            except:
-                continue
-
-        # Sort by updated_at descending
-        return sorted(memories, key=lambda x: x.get("updated_at", ""), reverse=True)
-
-    def search_memories(self, query: str) -> List[Dict[str, Any]]:
-        """Search memories by key, title, or content."""
-        query = query.lower()
-        results = []
-        all_memories = self.list_memories()
-
-        for mem in all_memories:
-            if (
-                query in mem["key"].lower()
-                or query in mem.get("title", "").lower()
-                or query in mem["content"].lower()
-            ):
-                results.append(mem)
-
-        return results
-
-    def delete_memory(self, key: str) -> bool:
-        """Delete a memory by key."""
-        file_path = self._get_file_path(key)
-        if file_path.exists():
-            file_path.unlink()
-            return True
-        return False
-
-    def get_stats(self) -> Dict[str, Any]:
-        """Get memory statistics."""
-        memories = self.list_memories()
+            f.write(md_content)
+            
+        # Phase 3: Register in SQLite Inventory!
+        relative_path = f"00_inbox/{file_path.name}"
+        db.add_note(note_id, safe_title, relative_path)
+            
+        # Phase 4: Register in ChromaDB (Semantic Vector Store)
+        # We index the raw Concept only (not the YAML tags) for better math representation
+        vector_db.add_or_update(
+            note_id=note_id,
+            document=content,
+            metadata={"title": safe_title, "path": relative_path}
+        )
+            
         return {
-            "total_count": len(memories),
-            "total_chars": sum(m["chars"] for m in memories),
-            "storage_path": str(self.cache_dir),
+            "key": note_id,
+            "title": safe_title,
+            "path": relative_path,
+            "updated_at": now,
+            "content": content
         }
 
+    # Dummy methods to keep WebUI and Server from crashing until Phase 3/4 (SQLite/Chroma)
+    def list_memories(self) -> List[Dict[str, Any]]:
+        return []
+    
+    def retrieve_memory(self, key: str) -> Optional[Dict[str, Any]]:
+        return None
+        
+    def search_memories(self, query: str) -> List[Dict[str, Any]]:
+        """Semantic search using ChromaDB."""
+        results = vector_db.search(query, n_results=5)
+        
+        formatted_results = []
+        if results and results.get('ids') and results['ids'][0]:
+            ids = results['ids'][0]
+            metadatas = results['metadatas'][0]
+            documents = results['documents'][0]
+            
+            for i, note_id in enumerate(ids):
+                # Resolve title and path directly from metadata fast-cache
+                title = metadatas[i].get('title', 'Unknown Title')
+                path = metadatas[i].get('path', 'Unknown Path')
+                snippet = documents[i][:150] + "..." if len(documents[i]) > 150 else documents[i]
+                
+                formatted_results.append({
+                    "key": note_id,
+                    "title": title,
+                    "path": path,
+                    "snippet": snippet,
+                    "updated_at": "vector_search" 
+                })
+        return formatted_results
+        
+    def delete_memory(self, key: str) -> bool:
+        return False
 
 # Global instance
 memory_manager = MemoryManager()

@@ -51,14 +51,12 @@ def create_memory():
         content = data.get('content', '')
         tags = data.get('tags', [])
         
-        if not key:
-            return jsonify({'success': False, 'error': 'Key is required'}), 400
+        # Phase 2: Intercept input and format via LLM
+        from core.llm_formatter import format_raw_input
+        formatted_data = format_raw_input(content)
         
-        # Add creation timestamp
-        timestamp = datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S %Z')
-        content_with_log = f"{content}\n\n---\n**Created:** {timestamp}"
-        
-        result = memory_manager.store_memory(key, content_with_log, tags, title)
+        # Save physical .md file adhering to Vault SOP
+        result = memory_manager.store_memory(content, formatted_data)
         return jsonify({'success': True, 'memory': result})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
